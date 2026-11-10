@@ -2,6 +2,7 @@ package chronik.akasha.recorder;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.content.pm.PackageManager;
@@ -10,6 +11,9 @@ import android.media.AudioDeviceInfo;
 import android.media.AudioFormat;
 import android.media.AudioManager;
 import android.media.AudioRecord;
+import android.media.audiofx.AutomaticGainControl;
+import android.media.audiofx.NoiseSuppressor;
+import android.media.audiofx.AcousticEchoCanceler;
 import android.media.MediaPlayer;
 import android.media.MediaRecorder;
 import android.net.Uri;
@@ -47,6 +51,23 @@ public class MainActivity extends Activity {
     private File outputFile;
     private MediaPlayer player;
     private File playingFile;
+    private TextView meters;
+    private AudioDeviceInfo selectedUsb;
+    private volatile double leftPeak = 0, rightPeak = 0;
+    private volatile double leftRms = 0, rightRms = 0;
+    private android.os.Handler meterHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+    private final Runnable meterUpdater = new Runnable() {
+        @Override public void run() {
+            if (recording && meters != null) {
+                meters.setText("Links: " + db(leftPeak) + " dBFS Peak / " + db(leftRms) + " dBFS RMS"
+                    + "\nRechts: " + db(rightPeak) + " dBFS Peak / " + db(rightRms) + " dBFS RMS");
+                meterHandler.postDelayed(this, 250);
+            }
+        }
+    };
+    private static String db(double value) {
+        return value <= 0.00001 ? "unter -100" : String.format(Locale.US, "%.1f", 20 * Math.log10(value));
+    }
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -58,7 +79,7 @@ public class MainActivity extends Activity {
         scroll.addView(layout);
 
         TextView heading = new TextView(this);
-        heading.setText("AKASHA RECORDER · 1.1");
+        heading.setText("AKASHA RECORDER · 1.2");
         heading.setTextColor(Color.WHITE);
         heading.setTextSize(23);
         layout.addView(heading);
@@ -69,6 +90,10 @@ public class MainActivity extends Activity {
 
         inputStatus = makeText("Audioeingang wird beim Aufnahmestart geprüft.", 14);
         layout.addView(inputStatus);
+
+        meters = makeText("Links / Rechts: noch keine Messung", 15);
+        meters.setPadding(0, 18, 0, 18);
+        layout.addView(meters);
 
         recordButton = new Button(this);
         recordButton.setText("● Aufnahme starten");
@@ -90,7 +115,7 @@ public class MainActivity extends Activity {
         recordingsList.setOrientation(LinearLayout.VERTICAL);
         layout.addView(recordingsList);
 
-        TextView note = makeText("USB-Stereo ist erst nach einem Links/Rechts-Test bestätigt. Teilen exportiert eine Kopie in den Musikordner.", 13);
+        TextView note = makeText("Nur USB-Audio als Eingang. Bluetooth dient nur zur Wiedergabe. Teilen exportiert eine zusätzliche Kopie nach Musik/Akasha Recorder.", 13);
         note.setPadding(0, 28, 0, 0);
         layout.addView(note);
         setContentView(scroll);
@@ -145,6 +170,12 @@ public class MainActivity extends Activity {
     private void startRecording() {
         if (recording || (recordingThread != null && recordingThread.isAlive())) return;
         stopPlayback();
+        selectedUsb = findUsbInput();
+        if (selectedUsb == null) {
+            status.setText("Kein USB-Audioeingang verbunden. Bitte Sidekick anschließen.");
+            inputStatus.setText("Aufnahme gesperrt: kein USB-Eingang.");
+            return;
+        }
         int min = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_STEREO,
                 AudioFormat.ENCODING_PCM_16BIT);
         if (min <= 0) {
@@ -161,14 +192,22 @@ public class MainActivity extends Activity {
             if (recorder.getState() != AudioRecord.STATE_INITIALIZED) {
                 throw new IllegalStateException("AudioRecord nicht initialisiert");
             }
-            AudioDeviceInfo usb = findUsbInput();
-            boolean preferred = usb != null && recorder.setPreferredDevice(usb);
+            AudioDeviceInfo usb = selectedUsb;
+            boolean preferred = recorder.setPreferredDevice(usb);
+            if (!preferred) throw new IllegalStateException("USB-Eingang konnte nicht ausgewählt werden");
             File dir = getExternalFilesDir(Environment.DIRECTORY_MUSIC);
             if (dir == null) throw new IllegalStateException("Speicher nicht verfügbar");
             outputFile = new File(dir, "Akasha-" + new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US)
                     .format(new Date()) + ".wav");
             recorder.startRecording();
+            AudioDeviceInfo routedNow = recorder.getRoutedDevice();
+            if (routedNow == null || routedNow.getId() != usb.getId()) {
+                throw new IllegalStateException("USB-Routing nicht bestätigt. Aufnahme abgebrochen.");
+            }
+            disableProcessing(recorder.getAudioSessionId());
             recording = true;
+            meterHandler.removeCallbacks(meterUpdater);
+            meterHandler.post(meterUpdater);
             recordButton.setEnabled(false);
             stopButton.setEnabled(true);
             status.setText("Aufnahme läuft · 48 kHz / Stereo / 16 Bit");
@@ -199,9 +238,14 @@ public class MainActivity extends Activity {
             out.write(new byte[44]);
             byte[] data = new byte[bufferSize];
             while (recording) {
+                AudioDeviceInfo route = activeRecorder.getRoutedDevice();
+                if (route == null || selectedUsb == null || route.getId() != selectedUsb.getId()) {
+                    throw new IllegalStateException("USB-Verbindung unterbrochen. Aufnahme beendet.");
+                }
                 int count = activeRecorder.read(data, 0, data.length);
                 if (count > 0) {
                     out.write(data, 0, count);
+                    measureStereo(data, count);
                     bytes += count;
                 } else if (count < 0) {
                     throw new IllegalStateException("Audiofehler: " + count);
@@ -211,6 +255,7 @@ public class MainActivity extends Activity {
             error = e.getMessage();
         } finally {
             recording = false;
+            meterHandler.removeCallbacks(meterUpdater);
             try { activeRecorder.stop(); } catch (Exception ignored) {}
             activeRecorder.release();
             recorder = null;
@@ -261,10 +306,62 @@ public class MainActivity extends Activity {
             Button share = new Button(this);
             share.setText("↗ Teilen");
             actions.addView(share, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+            Button delete = new Button(this);
+            delete.setText("Löschen");
+            actions.addView(delete, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
             recordingsList.addView(actions);
             play.setOnClickListener(v -> playFile(file));
             share.setOnClickListener(v -> shareFile(file));
+            delete.setOnClickListener(v -> confirmDelete(file));
         }
+    }
+
+    private void confirmDelete(File file) {
+        if (recording) { status.setText("Bitte zuerst Aufnahme stoppen."); return; }
+        new AlertDialog.Builder(this)
+            .setTitle("Aufnahme löschen?")
+            .setMessage(file.getName() + "\nDie Originalaufnahme wird endgültig gelöscht. Bereits geteilte Kopien bleiben erhalten.")
+            .setNegativeButton("Abbrechen", null)
+            .setPositiveButton("Löschen", (dialog, which) -> {
+                if (file.equals(playingFile)) stopPlayback();
+                boolean ok = file.delete();
+                status.setText(ok ? "Gelöscht: " + file.getName() : "Löschen fehlgeschlagen.");
+                refreshRecordings();
+            }).show();
+    }
+
+    private void measureStereo(byte[] data, int count) {
+        double sumL = 0, sumR = 0, peakL = 0, peakR = 0;
+        int frames = count / 4;
+        for (int i = 0; i < frames; i++) {
+            int offset = i * 4;
+            short l = (short) ((data[offset] & 255) | (data[offset + 1] << 8));
+            short r = (short) ((data[offset + 2] & 255) | (data[offset + 3] << 8));
+            double lv = Math.abs((double) l / 32768.0), rv = Math.abs((double) r / 32768.0);
+            peakL = Math.max(peakL, lv); peakR = Math.max(peakR, rv);
+            sumL += lv * lv; sumR += rv * rv;
+        }
+        if (frames > 0) {
+            leftPeak = peakL; rightPeak = peakR;
+            leftRms = Math.sqrt(sumL / frames); rightRms = Math.sqrt(sumR / frames);
+        }
+    }
+
+    private void disableProcessing(int sessionId) {
+        try {
+            if (AutomaticGainControl.isAvailable()) {
+                AutomaticGainControl fx = AutomaticGainControl.create(sessionId);
+                if (fx != null) { fx.setEnabled(false); fx.release(); }
+            }
+            if (NoiseSuppressor.isAvailable()) {
+                NoiseSuppressor fx = NoiseSuppressor.create(sessionId);
+                if (fx != null) { fx.setEnabled(false); fx.release(); }
+            }
+            if (AcousticEchoCanceler.isAvailable()) {
+                AcousticEchoCanceler fx = AcousticEchoCanceler.create(sessionId);
+                if (fx != null) { fx.setEnabled(false); fx.release(); }
+            }
+        } catch (Exception ignored) { }
     }
 
     private void playFile(File file) {
@@ -377,6 +474,7 @@ public class MainActivity extends Activity {
     @Override protected void onDestroy() {
         if (recording) stopRecording();
         stopPlayback();
+        meterHandler.removeCallbacks(meterUpdater);
         super.onDestroy();
     }
 }
