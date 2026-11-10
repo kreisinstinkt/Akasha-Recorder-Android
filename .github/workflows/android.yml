@@ -1,0 +1,38 @@
+
+name: Akasha Recorder APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Projekt herunterladen
+        uses: actions/checkout@v4
+
+      - name: Java 17 einrichten
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Android SDK einrichten
+        uses: android-actions/setup-android@v3
+
+      - name: Gradle einrichten
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: APK erstellen
+        run: gradle assembleDebug --stacktrace
+
+      - name: APK bereitstellen
+        uses: actions/upload-artifact@v4
+        with:
+          name: Akasha-Recorder-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+  
