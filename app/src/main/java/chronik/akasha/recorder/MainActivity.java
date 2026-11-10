@@ -242,6 +242,7 @@ public class MainActivity extends Activity {
     private void le32(
             RandomAccessFile f, long v) throws Exception {
         le16(f, v);
+        
         le16(f, v >> 16);
     }
 
@@ -253,3 +254,7 @@ public class MainActivity extends Activity {
     @Override protected void onDestroy() {
         if (recording) stopRecording();
         super.onDestroy();
+    }
+}
+  
+  
