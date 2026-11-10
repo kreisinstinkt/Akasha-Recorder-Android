@@ -1,0 +1,63 @@
+
+name: Akasha Recorder Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Projekt herunterladen
+        uses: actions/checkout@v4
+
+      - name: Java 17 einrichten
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Gradle einrichten
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Signaturschlüssel prüfen
+        env:
+          KEYSTORE_BASE64: ${{ secrets.AKASHA_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.AKASHA_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.AKASHA_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.AKASHA_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ] ||
+             [ -z "$STORE_PASSWORD" ] ||
+             [ -z "$KEY_ALIAS" ] ||
+             [ -z "$KEY_PASSWORD" ]; then
+            echo "::error::Release-Signierung ist noch nicht eingerichtet."
+            exit 1
+          fi
+
+      - name: Signaturschlüssel bereitstellen
+        env:
+          KEYSTORE_BASE64: ${{ secrets.AKASHA_KEYSTORE_BASE64 }}
+        run: |
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/akasha-release.jks"
+          chmod 600 "$RUNNER_TEMP/akasha-release.jks"
+
+      - name: Signierte APK erstellen
+        env:
+          AKASHA_KEYSTORE_PATH: ${{ runner.temp }}/akasha-release.jks
+          AKASHA_STORE_PASSWORD: ${{ secrets.AKASHA_STORE_PASSWORD }}
+          AKASHA_KEY_ALIAS: ${{ secrets.AKASHA_KEY_ALIAS }}
+          AKASHA_KEY_PASSWORD: ${{ secrets.AKASHA_KEY_PASSWORD }}
+        run: gradle assembleRelease --stacktrace
+
+      - name: APK bereitstellen
+        uses: actions/upload-artifact@v4
+        with:
+          name: Akasha-Recorder-Release
+          path: app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+          retention-days: 7
